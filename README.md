@@ -1,118 +1,188 @@
-# Drosera Trap Foundry Template
+# Multisig Anomaly Trap
 
-This repo is for quickly bootstrapping a new Drosera project. It includes instructions for creating your first trap, deploying it to the Drosera network, and updating it on the fly.
+A Drosera trap that detects compromised admin key attacks by monitoring ownership changes, timelock bypass attempts, and unauthorized proxy upgrades on protected protocols.
 
-[![view - Documentation](https://img.shields.io/badge/view-Documentation-blue?style=for-the-badge)](https://dev.drosera.io "Project documentation")
-[![Twitter](https://img.shields.io/twitter/follow/DroseraNetwork?style=for-the-badge)](https://x.com/DroseraNetwork)
+## Real-World Hack: Radiant Capital ($50M Loss)
 
-## Configure dev environment
+In October 2024, Radiant Capital was exploited for approximately **$50 million** when attackers compromised the private keys of three out of eleven multisig signers. The attackers used the compromised keys to push through a malicious contract upgrade that replaced the protocol's lending pool implementation with a backdoored version containing a `transferFrom` function that drained all user-approved funds. The entire attack -- from the malicious proposal to the fund extraction -- happened within minutes, far too fast for human governance monitoring to react.
 
-```bash
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
+This attack pattern is increasingly common. The Ronin Bridge hack ($624M, March 2022) also exploited compromised validator keys, and the Harmony Bridge hack ($100M, June 2022) resulted from stolen multisig keys. In all cases, the attackers bypassed or manipulated governance mechanisms to gain control of the protocol's upgrade path.
 
-# The trap-foundry-template utilizes node modules for dependency management
-# install Bun (optional)
-curl -fsSL https://bun.sh/install | bash
+## Attack Vector: Admin Key Compromise
 
-# install node modules
-bun install
+Admin key compromise attacks follow this pattern:
 
-# install vscode (optional)
-# - add solidity extension JuanBlanco.solidity
+1. **Attacker obtains private keys** -- through phishing, malware, social engineering, or insider threats. They need enough keys to meet the multisig threshold.
+2. **Attacker submits a malicious proposal** -- typically a proxy upgrade that replaces the protocol's implementation contract with a backdoored version.
+3. **Attacker bypasses or weakens governance safeguards** -- reducing timelock delays to zero, or executing the upgrade before the timelock period expires.
+4. **Malicious code is deployed** -- the proxy now points to attacker-controlled logic that can drain funds, mint unbacked tokens, or transfer ownership.
+5. **Funds are extracted** -- the attacker calls the backdoored functions to drain the protocol.
 
-# install drosera-cli
-curl -L https://app.drosera.io/install | bash
-droseraup
+The detectable signals: **ownership changes**, **timelock delay reductions**, and **contract code hash changes** (proxy upgrades).
+
+## How the Trap Works
+
+### Data Collection (`collect()`)
+
+Every block, the trap reads three pieces of state from the monitored protocol (`0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2`):
+
+- **`currentOwner`** -- The current owner address from `IOwnable.owner()`
+- **`timelockDelay`** -- The minimum delay enforced by the timelock controller from `ITimelockController.getMinDelay()`
+- **`codeHash`** -- The `codehash` of the monitored contract (detects proxy implementation changes)
+- **`blockNumber`** -- The current block number
+
+If any call reverts, the corresponding value defaults to zero/null so the trap avoids false positives.
+
+### Trigger Logic (`shouldRespond()`)
+
+The trap compares current and previous block data and triggers on four independent conditions:
+
+**Condition 1: Ownership Change**
+
+```
+TRIGGER if current_owner != previous_owner
+         AND neither is address(0)
 ```
 
-open the VScode preferences and Select `Soldity: Change workpace compiler version (Remote)`
+Any ownership transfer is a critical governance event that warrants immediate investigation.
 
-Select version `0.8.12`
+**Condition 2: Timelock Bypass (Delay Set to Zero)**
 
-## Quick Start
+```
+TRIGGER if previous_timelockDelay > 0
+         AND current_timelockDelay == 0
+```
 
-The following drosera commands set the `DROSERA_PRIVATE_KEY` environment variable in the command line but you can also use a `.env` file to store the private key of the account you want to use to deploy the trap.
+Setting the timelock delay to zero removes all governance protections and is the most direct indicator of an admin key compromise.
 
-### Hello World Trap
+**Condition 3: Timelock Weakening (Delay Reduced > 50%)**
 
-The drosera.toml file is configured to deploy a simple "Hello, World!" trap. Ensure the drosera.toml file is set to the following configuration:
+```
+TRIGGER if previous_timelockDelay > 0
+         AND current_timelockDelay < previous_timelockDelay / 2
+```
+
+A significant reduction in timelock delay, even if not to zero, suggests an attacker is gradually undermining governance safeguards.
+
+**Condition 4: Proxy Upgrade (Code Hash Change)**
+
+```
+TRIGGER if current_codeHash != previous_codeHash
+         AND neither is bytes32(0)
+```
+
+A change in the contract's code hash indicates that the proxy implementation was upgraded. Unauthorized upgrades are the primary mechanism used in admin key compromise attacks.
+
+## Threshold Values
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Ownership change | Any change | Ownership transfers are rare governance events. Any unexpected change is critical. |
+| Timelock delay = 0 | Zero delay | A zero timelock delay means governance protections are completely removed. This should never happen in a healthy protocol. |
+| Timelock weakening | > 50% reduction | Legitimate timelock adjustments are typically small. A 50%+ reduction signals an attacker weakening defenses. |
+| Code hash change | Any change | Proxy upgrades are planned events. An unexpected code hash change indicates a potentially malicious upgrade. |
+| `block_sample_size` | 10 | Captures changes over a 10-block window, providing enough context to detect multi-step governance attacks. |
+
+## Configuration (`drosera.toml`)
 
 ```toml
-response_contract = "0xdA890040Af0533D98B9F5f8FE3537720ABf83B0C"
-response_function = "helloworld(string)"
+ethereum_rpc = "https://ethereum-hoodi-rpc.publicnode.com"
+drosera_rpc = "https://relay.hoodi.drosera.io"
+eth_chain_id = 560048
+drosera_address = "0x91cB447BaFc6e0EA0F4Fe056F5a9b1F14bb06e5D"
+
+[traps.multisig_anomaly_trap]
+path = "out/MultisigAnomalyTrap.sol/MultisigAnomalyTrap.json"
+response_contract = "0x0000000000000000000000000000000000000000"
+response_function = "emergencyPause()"
+cooldown_period_blocks = 33
+min_number_of_operators = 1
+max_number_of_operators = 2
+block_sample_size = 10
+private_trap = false
+whitelist = []
 ```
 
-To deploy the trap, run the following commands:
+| Field | Description |
+|-------|-------------|
+| `ethereum_rpc` | RPC endpoint for the Ethereum chain being monitored (Hoodi testnet) |
+| `drosera_rpc` | RPC endpoint for the Drosera relay network |
+| `eth_chain_id` | Chain ID of the target network |
+| `drosera_address` | Address of the Drosera protocol contract |
+| `path` | Path to the compiled trap artifact (produced by `forge build`) |
+| `response_contract` | Address of the contract to call when the trap triggers (set to zero address as placeholder) |
+| `response_function` | Function signature to call on the response contract |
+| `cooldown_period_blocks` | Minimum blocks between consecutive responses (prevents spam) |
+| `min_number_of_operators` | Minimum Drosera operators required to reach consensus |
+| `max_number_of_operators` | Maximum operators that can participate |
+| `block_sample_size` | Number of consecutive blocks to collect data for |
+| `private_trap` | Whether this trap is restricted to whitelisted operators |
+
+## Architecture
+
+```
++---------------------------------------------+
+|         Monitored Protocol                   |
+|         0x87870Bca3F3fD6335C3F...            |
++----------+----------+-----------+------------+
+           |          |           |
+  owner()  | getMinDelay()  codehash
+           |          |           |
+           v          v           v
++----------+----------+-----------+------------+
+|            MultisigAnomalyTrap               |
+|                                              |
+|  collect():                                  |
+|  - currentOwner    (who controls protocol?)  |
+|  - timelockDelay   (is governance intact?)   |
+|  - codeHash        (was proxy upgraded?)     |
+|  - blockNumber                               |
++----------------------+-----------------------+
+                       |
+                       v
++----------------------+-----------------------+
+|           shouldRespond()                    |
+|                                              |
+|  Compare blocks:                             |
+|  - Owner changed?             --> TRIGGER    |
+|  - Timelock set to 0?         --> TRIGGER    |
+|  - Timelock reduced > 50%?    --> TRIGGER    |
+|  - Code hash changed?         --> TRIGGER    |
++----------------------+-----------------------+
+                       |
+                       | if triggered
+                       v
+            +----------+----------+
+            |  Response Contract   |
+            |  emergencyPause()    |
+            +---------------------+
+```
+
+## Build
 
 ```bash
-# Compile the Trap
-forge build
-
-# Deploy the Trap
-DROSERA_PRIVATE_KEY=0x.. drosera apply
+npm install && forge build
 ```
 
-After successfully deploying the trap, the CLI will add an `address` field to the `drosera.toml` file.
-
-Congratulations! You have successfully deployed your first trap!
-
-### Response Trap
-
-You can then update the trap by changing its logic and recompling it or changing the path field in the `drosera.toml` file to point to the Response Trap.
-
-The Response Trap is designed to trigger a response at a specific block number. To test the Response Trap, pick a future block number and update the Response Trap.
-Specify a response contract address and function signature in the drosera.toml file to the following:
-
-```toml
-response_contract = "0x183D78491555cb69B68d2354F7373cc2632508C7"
-response_function = "responseCallback(uint256)"
-```
-
-Finally, deploy the Response Trap by running the following commands:
-
-```bash
-# Compile the Trap
-forge build
-
-# Deploy the Trap
-DROSERA_PRIVATE_KEY=0x.. drosera apply
-```
-
-> Note: The `DROSERA_PRIVATE_KEY` environment variable can be used to deploy traps. You can also set it in the drosera.toml file as `private_key = "0x.."`.
-
-
-### Transfer Event Trap
-The TransferEventTrap is an example of how a Trap can parse event logs from a block and respond to a specific ERC-20 token transfer events.
-
-To deploy the Transfer Event Trap, uncomment the `transfer_event_trap` section in the `drosera.toml` file. Add the token address to the `tokenAddress` constant in the `TransferEventTrap.sol` file and then deploy the trap.
-
-### Alert Trap
-The AlertTrap is an example of how a Trap can parse event logs from a block and alert on a specific ERC-20 token transfer events.
-
-To deploy the Alert Trap, run the following commands:
-
-```bash
-forge build
-
-DROSERA_PRIVATE_KEY=0x.. drosera -c drosera.alerts.toml.j2 apply
-```
-
-> Note: The `.j2` file extension is used to indicate that the file is a jinja template and environment variables can be used in the file by wrapping them in `{{ env.VARIABLE_NAME }}`.
-
-Once configured properly, you can test the alert integration by running the following command;
-
-```bash
-DROSERA_PRIVATE_KEY=0x.. drosera -c drosera.alerts.toml.j2 send-test-alert --trap-name alert_trap
-```
-
-This will run the tests and you should see the alert being triggered in the console.
-
-
-## Testing
-
-Example tests are included in the `tests` directory. They simulate how Drosera Operators execute traps and determine if a response should be triggered. To run the tests, execute the following command:
+## Test
 
 ```bash
 forge test
 ```
+
+## Dry Run
+
+```bash
+drosera dryrun
+```
+
+## Deploy
+
+```bash
+export DROSERA_PRIVATE_KEY=<your-private-key>
+drosera apply
+```
+
+## License
+
+MIT
